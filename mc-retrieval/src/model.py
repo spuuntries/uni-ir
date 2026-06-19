@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import os
 os.environ["SPCONV_DISABLE_JIT"] = "1"
+os.environ["CUMM_DISABLE_JIT"] = "1"
 import spconv.pytorch as spconv
 from sentence_transformers import SentenceTransformer
 
