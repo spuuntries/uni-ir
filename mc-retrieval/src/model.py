@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import spconv.pytorch as spconv
 from sentence_transformers import SentenceTransformer
 
 
@@ -131,6 +132,89 @@ class VoxelEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Sparse Voxel Encoder — spconv based
+# ---------------------------------------------------------------------------
+
+class SparseVoxelEncoder(nn.Module):
+    """Encodes a block-ID grid into a dense embedding vector using sparse 3D convolutions."""
+
+    def __init__(
+        self,
+        num_block_types: int = 256,
+        block_embed_dim: int = 32,
+        channels: list[int] = [64, 128, 256],
+        embed_dim: int = 256,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.block_embedding = nn.Embedding(num_block_types, block_embed_dim)
+        
+        layers = []
+        in_ch = block_embed_dim
+        
+        for out_ch in channels:
+            layers.extend([
+                spconv.SubMConv3d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm1d(out_ch),
+                nn.GELU(),
+                spconv.SparseConv3d(out_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.BatchNorm1d(out_ch),
+                nn.GELU(),
+            ])
+            in_ch = out_ch
+            
+        self.sparse_conv_stack = spconv.SparseSequential(*layers)
+        
+        self.project = nn.Sequential(
+            nn.Linear(channels[-1], embed_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, voxels: torch.LongTensor) -> torch.Tensor:
+        """
+        Args:
+            voxels: (B, X, Y, Z) block ID tensor
+        Returns:
+            (B, embed_dim) unnormalised embedding
+        """
+        batch_size = voxels.shape[0]
+        
+        # Find non-air blocks
+        coords = torch.nonzero(voxels != 0)
+        
+        # Extract block IDs at these coordinates
+        block_ids = voxels[coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]]
+        
+        # Embed block IDs
+        features = self.block_embedding(block_ids)
+        
+        # spconv expects indices as int32
+        coords = coords.to(torch.int32)
+        spatial_shape = voxels.shape[1:]
+        
+        # Create SparseConvTensor
+        x = spconv.SparseConvTensor(
+            features=features,
+            indices=coords,
+            spatial_shape=spatial_shape,
+            batch_size=batch_size
+        )
+        
+        # Pass through sparse CNN stack
+        x = self.sparse_conv_stack(x)
+        
+        # Convert to dense (spatial resolution is small after strided convs)
+        dense_x = x.dense() # (B, C, X', Y', Z')
+        
+        # Global Average Pooling over spatial dimensions
+        pooled = nn.functional.adaptive_avg_pool3d(dense_x, 1) # (B, C, 1, 1, 1)
+        pooled = pooled.flatten(1) # (B, C)
+        
+        out = self.project(pooled)
+        return out
+
+
+# ---------------------------------------------------------------------------
 # Text Encoder — Sentence Transformer + Projection
 # ---------------------------------------------------------------------------
 
@@ -195,16 +279,26 @@ class DualEncoder(nn.Module):
         super().__init__()
         model_cfg = cfg["model"]
         dropout = model_cfg.get("dropout", 0.3)
+        use_sparse = model_cfg.get("use_sparse", False)
 
-        self.voxel_encoder = VoxelEncoder(
-            num_block_types=num_block_types,
-            block_embed_dim=model_cfg["block_embed_dim"],
-            channels=model_cfg["voxel_channels"],
-            embed_dim=model_cfg["embed_dim"],
-            dropout=dropout,
-            use_learned_stem=model_cfg.get("use_learned_stem", False),
-            use_depthwise_separable=model_cfg.get("use_depthwise_separable", False),
-        )
+        if use_sparse:
+            self.voxel_encoder = SparseVoxelEncoder(
+                num_block_types=num_block_types,
+                block_embed_dim=model_cfg["block_embed_dim"],
+                channels=model_cfg["voxel_channels"],
+                embed_dim=model_cfg["embed_dim"],
+                dropout=dropout,
+            )
+        else:
+            self.voxel_encoder = VoxelEncoder(
+                num_block_types=num_block_types,
+                block_embed_dim=model_cfg["block_embed_dim"],
+                channels=model_cfg["voxel_channels"],
+                embed_dim=model_cfg["embed_dim"],
+                dropout=dropout,
+                use_learned_stem=model_cfg.get("use_learned_stem", False),
+                use_depthwise_separable=model_cfg.get("use_depthwise_separable", False),
+            )
         self.text_encoder = TextEncoder(
             model_name=model_cfg["text_model"],
             text_hidden_dim=model_cfg["text_hidden_dim"],
