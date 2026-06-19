@@ -310,6 +310,7 @@ class MaskedVoxelModel(nn.Module):
 # Sparse Masked Voxel Model (spconv)
 # ---------------------------------------------------------------------------
 
+
 class SparseMaskedVoxelModel(nn.Module):
     def __init__(
         self,
@@ -329,58 +330,97 @@ class SparseMaskedVoxelModel(nn.Module):
         self.encoder_blocks = nn.ModuleList()
         in_ch = block_embed_dim
         for i, out_ch in enumerate(channels):
-            self.encoder_blocks.append(nn.ModuleDict({
-                "subm": spconv.SubMConv3d(in_ch, out_ch, 3, padding=1, bias=False, indice_key=f"subm{i}"),
-                "subm_bn": nn.BatchNorm1d(out_ch),
-                "down": spconv.SparseConv3d(out_ch, out_ch, 3, stride=2, padding=1, bias=False, indice_key=f"down{i}"),
-                "down_bn": nn.BatchNorm1d(out_ch)
-            }))
+            self.encoder_blocks.append(
+                nn.ModuleDict(
+                    {
+                        "subm": spconv.SubMConv3d(
+                            in_ch,
+                            out_ch,
+                            3,
+                            padding=1,
+                            bias=False,
+                            indice_key=f"subm{i}",
+                        ),
+                        "subm_bn": nn.BatchNorm1d(out_ch),
+                        "down": spconv.SparseConv3d(
+                            out_ch,
+                            out_ch,
+                            3,
+                            stride=2,
+                            padding=1,
+                            bias=False,
+                            indice_key=f"down{i}",
+                        ),
+                        "down_bn": nn.BatchNorm1d(out_ch),
+                    }
+                )
+            )
             in_ch = out_ch
 
-        self.bottleneck = spconv.SubMConv3d(in_ch, in_ch, 3, padding=1, bias=False, indice_key=f"subm{len(channels)}")
+        self.bottleneck = spconv.SubMConv3d(
+            in_ch, in_ch, 3, padding=1, bias=False, indice_key=f"subm{len(channels)}"
+        )
         self.bottleneck_bn = nn.BatchNorm1d(in_ch)
 
         self.decoder_blocks = nn.ModuleList()
         for i in reversed(range(len(channels))):
             skip_ch = channels[i]
-            out_ch = channels[i-1] if i > 0 else block_embed_dim
-            self.decoder_blocks.append(nn.ModuleDict({
-                "up": spconv.SparseInverseConv3d(in_ch, skip_ch, 3, bias=False, indice_key=f"down{i}"),
-                "up_bn": nn.BatchNorm1d(skip_ch),
-                "dec": spconv.SubMConv3d(skip_ch * 2, out_ch, 3, padding=1, bias=False, indice_key=f"subm{i}"),
-                "dec_bn": nn.BatchNorm1d(out_ch)
-            }))
+            out_ch = channels[i - 1] if i > 0 else block_embed_dim
+            self.decoder_blocks.append(
+                nn.ModuleDict(
+                    {
+                        "up": spconv.SparseInverseConv3d(
+                            in_ch, skip_ch, 3, bias=False, indice_key=f"down{i}"
+                        ),
+                        "up_bn": nn.BatchNorm1d(skip_ch),
+                        "dec": spconv.SubMConv3d(
+                            skip_ch * 2,
+                            out_ch,
+                            3,
+                            padding=1,
+                            bias=False,
+                            indice_key=f"subm{i}",
+                        ),
+                        "dec_bn": nn.BatchNorm1d(out_ch),
+                    }
+                )
+            )
             in_ch = out_ch
 
-        self.pred_head = nn.Linear(block_embed_dim, num_block_types)
+        self.pred_head = nn.Conv3d(block_embed_dim, num_block_types, 1)
         self.gelu = nn.GELU()
 
     def forward(self, voxels: torch.LongTensor):
         batch_size = voxels.shape[0]
-        
+
         # 1. Find non-air coordinates
         non_air_coords = torch.nonzero(voxels != 0)
-        
+
         # 2. Extract their block IDs
-        block_ids = voxels[non_air_coords[:, 0], non_air_coords[:, 1], non_air_coords[:, 2], non_air_coords[:, 3]]
-        
+        block_ids = voxels[
+            non_air_coords[:, 0],
+            non_air_coords[:, 1],
+            non_air_coords[:, 2],
+            non_air_coords[:, 3],
+        ]
+
         # 3. Create boolean mask for THESE non-air blocks
         num_non_air = len(block_ids)
         rand = torch.rand(num_non_air, device=voxels.device)
         is_masked = rand < self.mask_ratio
-        
+
         # 4. Replace masked IDs with mask_token_id
         masked_block_ids = block_ids.clone()
         masked_block_ids[is_masked] = self.mask_token_id
-        
+
         # 5. Embed
         features = self.block_embedding(masked_block_ids)
-        
+
         # 6. Create Sparse Tensor
         coords = non_air_coords.to(torch.int32)
         spatial_shape = voxels.shape[1:]
         x = spconv.SparseConvTensor(features, coords, spatial_shape, batch_size)
-        
+
         # --- Encoder ---
         encoder_features = [x]
         curr = x
@@ -390,40 +430,55 @@ class SparseMaskedVoxelModel(nn.Module):
             curr = block["down"](subm)
             curr = curr.replace_feature(self.gelu(block["down_bn"](curr.features)))
             encoder_features.append(subm)
-            
+
         # --- Bottleneck ---
         curr = self.bottleneck(curr)
         curr = curr.replace_feature(self.gelu(self.bottleneck_bn(curr.features)))
-        
+
         # --- Decoder ---
         for i, block in enumerate(self.decoder_blocks):
             up = block["up"](curr)
             up = up.replace_feature(self.gelu(block["up_bn"](up.features)))
-            skip = encoder_features[-(i+1)]
+            skip = encoder_features[-(i + 1)]
             cat_features = torch.cat([up.features, skip.features], dim=1)
             cat = up.replace_feature(cat_features)
             curr = block["dec"](cat)
             curr = curr.replace_feature(self.gelu(block["dec_bn"](curr.features)))
-            
-        # Prediction only on masked coordinates
-        masked_features = curr.features[is_masked]
-        logits = self.pred_head(masked_features) 
-        labels = block_ids[is_masked]
-        
-        return logits, labels
+
+        # spconv sorts coordinates internally, so curr.features is scrambled relative to block_ids
+        dense_features = curr.dense()  # (B, block_embed_dim, 32, 32, 32)
+        logits = self.pred_head(dense_features)  # (B, num_block_types, 32, 32, 32)
+
+        # Recreate the 3D dense boolean mask
+        dense_mask = torch.zeros_like(voxels, dtype=torch.bool)
+        dense_mask[
+            non_air_coords[:, 0],
+            non_air_coords[:, 1],
+            non_air_coords[:, 2],
+            non_air_coords[:, 3],
+        ] = is_masked
+
+        return logits, dense_mask
 
     def get_encoder_state_dict(self):
         state = {}
-        state["block_embedding.weight"] = self.block_embedding.weight[:self.num_block_types].clone()
-        
+        state["block_embedding.weight"] = self.block_embedding.weight[
+            : self.num_block_types
+        ].clone()
+
         offset = 0
         for i, block in enumerate(self.encoder_blocks):
-            for name, seq_idx in [("subm", 0), ("subm_bn", 1), ("down", 3), ("down_bn", 4)]:
+            for name, seq_idx in [
+                ("subm", 0),
+                ("subm_bn", 1),
+                ("down", 3),
+                ("down_bn", 4),
+            ]:
                 mod = block[name]
                 for k, v in mod.state_dict().items():
                     state[f"sparse_conv_stack.{offset + seq_idx}.{k}"] = v.clone()
             offset += 6
-                
+
         return state
 
 
@@ -479,7 +534,7 @@ def pretrain(cfg: dict):
     # --- model ---
     model_cfg = cfg["model"]
     use_sparse = model_cfg.get("use_sparse", False)
-    
+
     if use_sparse:
         model = SparseMaskedVoxelModel(
             num_block_types=num_blocks,
@@ -504,23 +559,24 @@ def pretrain(cfg: dict):
     if model_cfg.get("semantic_init", False):
         from dataset import extract_block_names
         from model import TextEncoder, apply_semantic_init
+
         block_names = extract_block_names(df, block_mapping)
         # mask token gets an arbitrary string "mask token"
         block_names.append("mask token")
-        
+
         temp_text_encoder = TextEncoder(
             model_name=model_cfg["text_model"],
             text_hidden_dim=model_cfg["text_hidden_dim"],
             embed_dim=model_cfg["embed_dim"],
-            freeze=True
+            freeze=True,
         ).to(device)
-        
+
         apply_semantic_init(
             voxel_embedding_layer=model.block_embedding,
             text_encoder=temp_text_encoder,
             block_names=block_names,
             block_embed_dim=model_cfg["block_embed_dim"],
-            device=device
+            device=device,
         )
         del temp_text_encoder
         torch.cuda.empty_cache()
@@ -551,36 +607,22 @@ def pretrain(cfg: dict):
         for voxels in pbar:
             voxels = voxels.to(device)
 
-            if use_sparse:
-                logits, labels = model(voxels)
-                
-                loss = F.cross_entropy(logits, labels)
-                
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                
-                preds = logits.argmax(dim=1)
-                correct = (preds == labels).sum().item()
-                n_masked = len(labels)
-            else:
-                logits, mask = model(voxels)
-    
-                # Loss only on masked positions
-                # logits: (B, C, 32, 32, 32), targets: (B, 32, 32, 32)
-                loss = F.cross_entropy(logits, voxels, reduction="none")  # (B, 32, 32, 32)
-                loss = (loss * mask.float()).sum() / mask.float().sum().clamp(min=1)
-    
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-    
-                # Accuracy on masked positions
-                preds = logits.argmax(dim=1)  # (B, 32, 32, 32)
-                correct = ((preds == voxels) & mask).sum().item()
-                n_masked = mask.sum().item()
+            logits, mask = model(voxels)
+
+            # Loss only on masked positions
+            # logits: (B, C, 32, 32, 32), targets: (B, 32, 32, 32)
+            loss = F.cross_entropy(logits, voxels, reduction="none")  # (B, 32, 32, 32)
+            loss = (loss * mask.float()).sum() / mask.float().sum().clamp(min=1)
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            # Accuracy on masked positions
+            preds = logits.argmax(dim=1)  # (B, 32, 32, 32)
+            correct = ((preds == voxels) & mask).sum().item()
+            n_masked = mask.sum().item()
 
             total_loss += loss.item()
             total_correct += correct
