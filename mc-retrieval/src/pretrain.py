@@ -632,7 +632,6 @@ def pretrain(cfg: dict):
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            scheduler.step()
 
             # compute training accuracy (just for logging)
             with torch.no_grad():
