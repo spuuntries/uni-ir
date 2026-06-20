@@ -24,7 +24,6 @@ from utils import load_config, set_seed, get_device, save_checkpoint
 from model import DepthwiseSeparableConv3d
 
 
-
 # ---------------------------------------------------------------------------
 # Masking
 # ---------------------------------------------------------------------------
@@ -155,16 +154,21 @@ class MaskedVoxelModel(nn.Module):
         self.simclr_proj = nn.Sequential(
             nn.Linear(channels[-1], channels[-1]),
             nn.GELU(),
-            nn.Linear(channels[-1], embed_dim)
+            nn.Linear(channels[-1], embed_dim),
         )
 
-    def forward(self, voxels: torch.LongTensor, return_simclr: bool = False):
+    def forward(
+        self,
+        voxels: torch.LongTensor,
+        return_simclr: bool = False,
+        return_mvm: bool = True,
+    ):
         """
         Args:
             voxels: (B, 32, 32, 32) original block IDs
         Returns:
-            logits: (B, num_blocks, 32, 32, 32) predictions
-            mask:   (B, 32, 32, 32) bool mask of what was masked
+            logits: (B, num_blocks, 32, 32, 32) predictions (or None if return_mvm=False)
+            mask:   (B, 32, 32, 32) bool mask of what was masked (or None if return_mvm=False)
             (optional) simclr_emb: (B, embed_dim) if return_simclr is True
         """
         # Create mask and apply
@@ -186,6 +190,15 @@ class MaskedVoxelModel(nn.Module):
         e2 = self.enc2(self.pool1(e1))
         bn = self.bottleneck(self.pool2(e2))
 
+        simclr_emb = None
+        if return_simclr:
+            simclr_emb = self.global_pool(bn).flatten(1)
+            simclr_emb = self.simclr_proj(simclr_emb)
+            simclr_emb = nn.functional.normalize(simclr_emb, dim=-1)
+
+        if not return_mvm:
+            return None, None, simclr_emb
+
         # Decoder with skip connections
         d2 = self.up2(bn)
         d2 = self.dec2(torch.cat([d2, e2], dim=1))
@@ -201,9 +214,6 @@ class MaskedVoxelModel(nn.Module):
             logits = self.pred_head(d1)
 
         if return_simclr:
-            simclr_emb = self.global_pool(bn).flatten(1)
-            simclr_emb = self.simclr_proj(simclr_emb)
-            simclr_emb = nn.functional.normalize(simclr_emb, dim=-1)
             return logits, mask, simclr_emb
 
         return logits, mask
@@ -290,8 +300,8 @@ def pretrain(cfg: dict):
     batch_size = pt_cfg.get("batch_size", 256)
     lr = pt_cfg.get("lr", 1e-3)
     ckpt_dir = pt_cfg.get("checkpoint_dir", "checkpoints")
-    
-    pretrain_mode = pt_cfg.get("mode", "mvm") # "mvm", "simclr", "hybrid"
+
+    pretrain_mode = pt_cfg.get("mode", "mvm")  # "mvm", "simclr", "hybrid"
     mvm_weight = pt_cfg.get("mvm_weight", 1.0)
     simclr_weight = pt_cfg.get("simclr_weight", 1.0)
     num_views = 2 if pretrain_mode in ["simclr", "hybrid"] else 1
@@ -347,23 +357,24 @@ def pretrain(cfg: dict):
     if model_cfg.get("semantic_init", False):
         from dataset import extract_block_names
         from model import TextEncoder, apply_semantic_init
+
         block_names = extract_block_names(df, block_mapping)
         # mask token gets an arbitrary string "mask token"
         block_names.append("mask token")
-        
+
         temp_text_encoder = TextEncoder(
             model_name=model_cfg["text_model"],
             text_hidden_dim=model_cfg["text_hidden_dim"],
             embed_dim=model_cfg["embed_dim"],
-            freeze=True
+            freeze=True,
         ).to(device)
-        
+
         apply_semantic_init(
             voxel_embedding_layer=model.block_embedding,
             text_encoder=temp_text_encoder,
             block_names=block_names,
             block_embed_dim=model_cfg["block_embed_dim"],
-            device=device
+            device=device,
         )
         del temp_text_encoder
         torch.cuda.empty_cache()
@@ -381,6 +392,7 @@ def pretrain(cfg: dict):
     print(f"  Batch size: {batch_size}")
     if pretrain_mode in ["simclr", "hybrid"]:
         from losses import SimCLRLoss
+
         simclr_criterion = SimCLRLoss(temperature_init=0.1).to(device)
     print()
 
@@ -405,17 +417,19 @@ def pretrain(cfg: dict):
 
             optimizer.zero_grad()
             loss = 0.0
-            
+
             if pretrain_mode == "mvm":
                 logits, mask = model(voxels)
                 mvm_loss = F.cross_entropy(logits, voxels, reduction="none")
-                mvm_loss = (mvm_loss * mask.float()).sum() / mask.float().sum().clamp(min=1)
+                mvm_loss = (mvm_loss * mask.float()).sum() / mask.float().sum().clamp(
+                    min=1
+                )
                 loss = mvm_loss
-                
+
                 preds = logits.argmax(dim=1)
                 correct = ((preds == voxels) & mask).sum().item()
                 n_masked = mask.sum().item()
-                
+
                 total_mvm_loss += mvm_loss.item()
                 total_correct += correct
                 total_masked += n_masked
@@ -423,34 +437,33 @@ def pretrain(cfg: dict):
             elif pretrain_mode == "simclr":
                 old_mask_ratio = model.mask_ratio
                 model.mask_ratio = 0.0
-                _, _, z1 = model(voxels1, return_simclr=True)
-                _, _, z2 = model(voxels2, return_simclr=True)
+                _, _, z1 = model(voxels1, return_simclr=True, return_mvm=False)
+                _, _, z2 = model(voxels2, return_simclr=True, return_mvm=False)
                 model.mask_ratio = old_mask_ratio
-                
+
                 simclr_loss = simclr_criterion(z1, z2)
                 loss = simclr_loss
-                
+
                 total_simclr_loss += simclr_loss.item()
 
             elif pretrain_mode == "hybrid":
-                logits1, mask1, z1 = model(voxels1, return_simclr=True)
-                logits2, mask2, z2 = model(voxels2, return_simclr=True)
-                
-                mvm_loss1 = F.cross_entropy(logits1, voxels1, reduction="none")
-                mvm_loss1 = (mvm_loss1 * mask1.float()).sum() / mask1.float().sum().clamp(min=1)
-                
-                mvm_loss2 = F.cross_entropy(logits2, voxels2, reduction="none")
-                mvm_loss2 = (mvm_loss2 * mask2.float()).sum() / mask2.float().sum().clamp(min=1)
-                
-                mvm_loss = (mvm_loss1 + mvm_loss2) / 2.0
+                # only run the decoder (MVM) on view 1
+                logits1, mask1, z1 = model(voxels1, return_simclr=True, return_mvm=True)
+                _, _, z2 = model(voxels2, return_simclr=True, return_mvm=False)
+
+                mvm_loss = F.cross_entropy(logits1, voxels1, reduction="none")
+                mvm_loss = (mvm_loss * mask1.float()).sum() / mask1.float().sum().clamp(
+                    min=1
+                )
+
                 simclr_loss = simclr_criterion(z1, z2)
-                
+
                 loss = (mvm_weight * mvm_loss) + (simclr_weight * simclr_loss)
-                
+
                 preds = logits1.argmax(dim=1)
                 correct = ((preds == voxels1) & mask1).sum().item()
                 n_masked = mask1.sum().item()
-                
+
                 total_mvm_loss += mvm_loss.item()
                 total_simclr_loss += simclr_loss.item()
                 total_correct += correct
@@ -470,12 +483,18 @@ def pretrain(cfg: dict):
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
             else:
                 acc = correct / max(n_masked, 1)
-                pbar.set_postfix(loss=f"{loss.item():.4f}", mvm=f"{mvm_loss.item():.3f}", sim=f"{simclr_loss.item():.3f}")
+                pbar.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    mvm=f"{mvm_loss.item():.3f}",
+                    sim=f"{simclr_loss.item():.3f}",
+                )
 
         scheduler.step()
 
         avg_loss = total_loss / max(num_batches, 1)
-        avg_acc = total_correct / max(total_masked, 1) if pretrain_mode != "simclr" else 0.0
+        avg_acc = (
+            total_correct / max(total_masked, 1) if pretrain_mode != "simclr" else 0.0
+        )
         lr_current = optimizer.param_groups[0]["lr"]
 
         if pretrain_mode == "simclr":
