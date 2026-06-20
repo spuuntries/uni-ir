@@ -372,7 +372,6 @@ class SparseMaskedVoxelModel(nn.Module):
                         "up": spconv.SparseInverseConv3d(
                             in_ch, skip_ch, 3, bias=False, indice_key=f"down{i}"
                         ),
-                        "up_bn": nn.BatchNorm1d(skip_ch),
                         "dec": spconv.SubMConv3d(
                             skip_ch * 2,
                             out_ch,
@@ -438,7 +437,6 @@ class SparseMaskedVoxelModel(nn.Module):
         # --- Decoder ---
         for i, block in enumerate(self.decoder_blocks):
             up = block["up"](curr)
-            up = up.replace_feature(self.gelu(block["up_bn"](up.features)))
             skip = encoder_features[-(i + 1)]
             cat_features = torch.cat([up.features, skip.features], dim=1)
             cat = up.replace_feature(cat_features)
