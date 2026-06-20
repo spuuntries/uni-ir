@@ -619,8 +619,8 @@ def pretrain(cfg: dict):
         num_batches = 0
 
         pbar = tqdm(loader, desc=f"  epoch {epoch:3d}", leave=False)
-        for batch_idx, batch in enumerate(pbar):
-            voxels = batch["voxel_data"].to(device)
+        for batch_idx, voxels in enumerate(pbar):
+            voxels = voxels.to(device)
 
             optimizer.zero_grad()
 
