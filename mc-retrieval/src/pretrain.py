@@ -386,7 +386,7 @@ class SparseMaskedVoxelModel(nn.Module):
             )
             in_ch = out_ch
 
-        self.pred_head = nn.Conv3d(block_embed_dim, num_block_types, 1)
+        self.pred_head = nn.Linear(block_embed_dim, num_block_types)
         self.gelu = nn.GELU()
 
     def forward(self, voxels: torch.LongTensor):
@@ -443,11 +443,7 @@ class SparseMaskedVoxelModel(nn.Module):
             curr = block["dec"](cat)
             curr = curr.replace_feature(self.gelu(block["dec_bn"](curr.features)))
 
-        # spconv sorts coordinates internally, so curr.features is scrambled relative to block_ids
-        dense_features = curr.dense()  # (B, block_embed_dim, 32, 32, 32)
-        logits = self.pred_head(dense_features)  # (B, num_block_types, 32, 32, 32)
-
-        # Recreate the 3D dense boolean mask
+        # Create a dense boolean mask of masked blocks
         dense_mask = torch.zeros_like(voxels, dtype=torch.bool)
         dense_mask[
             non_air_coords[:, 0],
@@ -456,7 +452,28 @@ class SparseMaskedVoxelModel(nn.Module):
             non_air_coords[:, 3],
         ] = is_masked
 
-        return logits, dense_mask
+        # Indices of the sparse tensor in their current scrambled order
+        inds = curr.indices.long()
+
+        # Query the dense mask to find which of the scrambled features correspond to masked blocks
+        scrambled_is_masked = dense_mask[inds[:, 0], inds[:, 1], inds[:, 2], inds[:, 3]]
+
+        # Compute logits on the active sparse features (N, 512)
+        logits = self.pred_head(curr.features)
+
+        # Extract the logits for the masked blocks (M, 512)
+        masked_logits = logits[scrambled_is_masked]
+
+        # Extract the true labels for the masked blocks from the original voxels tensor (M,)
+        masked_coords = inds[scrambled_is_masked]
+        masked_labels = voxels[
+            masked_coords[:, 0],
+            masked_coords[:, 1],
+            masked_coords[:, 2],
+            masked_coords[:, 3],
+        ]
+
+        return masked_logits, masked_labels
 
     def get_encoder_state_dict(self):
         state = {}
@@ -602,32 +619,33 @@ def pretrain(cfg: dict):
         num_batches = 0
 
         pbar = tqdm(loader, desc=f"  epoch {epoch:3d}", leave=False)
-        for voxels in pbar:
-            voxels = voxels.to(device)
-
-            logits, mask = model(voxels)
-
-            # Loss only on masked positions
-            # logits: (B, C, 32, 32, 32), targets: (B, 32, 32, 32)
-            loss = F.cross_entropy(logits, voxels, reduction="none")  # (B, 32, 32, 32)
-            loss = (loss * mask.float()).sum() / mask.float().sum().clamp(min=1)
+        for batch_idx, batch in enumerate(pbar):
+            voxels = batch["voxel_data"].to(device)
 
             optimizer.zero_grad()
+
+            # Forward pass
+            logits, labels = model(voxels)
+
+            loss = F.cross_entropy(logits, labels)
+
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            scheduler.step()
 
-            # Accuracy on masked positions
-            preds = logits.argmax(dim=1)  # (B, 32, 32, 32)
-            correct = ((preds == voxels) & mask).sum().item()
-            n_masked = mask.sum().item()
+            # compute training accuracy (just for logging)
+            with torch.no_grad():
+                preds = logits.argmax(dim=1)
+                n_correct = (preds == labels).sum().item()
+                n_masked = len(labels)
 
             total_loss += loss.item()
-            total_correct += correct
+            total_correct += n_correct
             total_masked += n_masked
             num_batches += 1
 
-            acc = correct / max(n_masked, 1)
+            acc = n_correct / max(n_masked, 1)
             pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.3f}")
 
         scheduler.step()
