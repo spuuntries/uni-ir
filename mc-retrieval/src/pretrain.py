@@ -381,12 +381,26 @@ class SparseMaskedVoxelModel(nn.Module):
                             indice_key=f"subm{i}",
                         ),
                         "dec_bn": nn.BatchNorm1d(out_ch),
+                        "dec2": spconv.SubMConv3d(
+                            out_ch,
+                            out_ch,
+                            3,
+                            padding=1,
+                            bias=False,
+                            indice_key=f"subm{i}",
+                        ),
+                        "dec2_bn": nn.BatchNorm1d(out_ch),
                     }
                 )
             )
             in_ch = out_ch
 
-        self.pred_head = nn.Linear(block_embed_dim, num_block_types)
+        self.pred_head = nn.Sequential(
+            nn.Linear(block_embed_dim, block_embed_dim * 4),
+            nn.GELU(),
+            nn.BatchNorm1d(block_embed_dim * 4),
+            nn.Linear(block_embed_dim * 4, num_block_types)
+        )
         self.gelu = nn.GELU()
 
     def forward(self, voxels: torch.LongTensor):
@@ -442,6 +456,11 @@ class SparseMaskedVoxelModel(nn.Module):
             cat = up.replace_feature(cat_features)
             curr = block["dec"](cat)
             curr = curr.replace_feature(self.gelu(block["dec_bn"](curr.features)))
+            
+            # Residual block
+            res = block["dec2"](curr)
+            res = res.replace_feature(block["dec2_bn"](res.features))
+            curr = curr.replace_feature(self.gelu(curr.features + res.features))
 
         # Create a dense boolean mask of masked blocks
         dense_mask = torch.zeros_like(voxels, dtype=torch.bool)
